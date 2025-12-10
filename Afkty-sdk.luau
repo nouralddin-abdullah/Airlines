@@ -1,403 +1,608 @@
+local Afkty = {}
+Afkty.__index = Afkty
+Afkty.Version = "2.0.0"
+-- Services
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local MarketplaceService = game:GetService("MarketplaceService")
+local RunService = game:GetService("RunService")
 
-local Afkty = {}
-Afkty.__index = Afkty
+-- State
+local _state = {
+    ws = nil,
+    connected = false,
+    authenticated = false,
+    sessionId = nil,
+    reconnectAttempts = 0,
+    heartbeatThread = nil,
+    messageQueue = {},
+    lastStatus = nil,
+    lastStatusTime = 0
+}
 
--- Internal state
-local _ws = nil
-local _connected = false
-local _authenticated = false
-local _reconnectAttempts = 0
-local _heartbeatThread = nil
+-- Configuration with defaults
 local _config = {
-  serverUrl = nil,
-  connectionKey = nil,
-  autoReconnect = true,
-  reconnectDelay = 5,
-  maxReconnectAttempts = 10,
-  heartbeatInterval = 10,
-  debug = false
+    serverUrl = nil,
+    connectionKey = nil,
+    autoReconnect = true,
+    reconnectDelay = 5,
+    maxReconnectAttempts = 10,
+    heartbeatInterval = 10,
+    debug = false,
+    queueOfflineMessages = true,
+    statusCooldown = 10,  -- Minimum seconds between status updates
+    logBatchSize = 5,     -- Batch logs to reduce network calls
+    logBatchDelay = 2     -- Seconds to wait before sending batched logs
+}
+
+-- Log batching
+local _logBatch = {
+    messages = {},
+    timer = nil
 }
 
 -- Events
 Afkty.Events = {
-  Connected = Instance.new("BindableEvent"),
-  Disconnected = Instance.new("BindableEvent"),
-  Command = Instance.new("BindableEvent"),
-  Error = Instance.new("BindableEvent")
+    Connected = Instance.new("BindableEvent"),
+    Disconnected = Instance.new("BindableEvent"),
+    Reconnecting = Instance.new("BindableEvent"),
+    Command = Instance.new("BindableEvent"),
+    Error = Instance.new("BindableEvent"),
+    RateLimited = Instance.new("BindableEvent")
 }
 
--- Internal logging
-local function log(level, message)
-  if _config.debug or level == "error" then
-    print(string.format("[Afkty][%s] %s", level:upper(), message))
-  end
+-- Public event connections
+Afkty.OnConnected = Afkty.Events.Connected.Event
+Afkty.OnDisconnected = Afkty.Events.Disconnected.Event
+Afkty.OnReconnecting = Afkty.Events.Reconnecting.Event
+Afkty.OnCommand = Afkty.Events.Command.Event
+Afkty.OnError = Afkty.Events.Error.Event
+Afkty.OnRateLimited = Afkty.Events.RateLimited.Event
+
+--------------------------------------------------------------------------------
+-- Internal Utilities
+--------------------------------------------------------------------------------
+
+local function log(level, msg)
+    if _config.debug or level == "error" or level == "warn" then
+        local prefix = ({
+            info = "[Afkty]",
+            warn = "[Afkty WARNING]",
+            error = "[Afkty ERROR]",
+            debug = "[Afkty DEBUG]"
+        })[level] or "[Afkty]"
+        print(prefix, msg)
+    end
 end
 
--- Detect WebSocket implementation
-local function getWebSocketImpl()
-  if syn and syn.websocket and syn.websocket.connect then
-    return syn.websocket.connect, "Synapse"
-  elseif WebSocket and WebSocket.connect then
-    return WebSocket.connect, "Generic"
-  elseif Fluxus and Fluxus.websocket then
-    return Fluxus.websocket.connect, "Fluxus"
-  elseif getgenv().WebSocket then
-    return getgenv().WebSocket.connect, "Environment"
-  end
-  return nil, nil
+local function getWebSocket()
+    -- Priority order for WebSocket implementations
+    local implementations = {
+        { check = function() return syn and syn.websocket end, get = function() return syn.websocket.connect end, name = "Synapse" },
+        { check = function() return WebSocket end, get = function() return WebSocket.connect end, name = "WebSocket" },
+        { check = function() return Fluxus and Fluxus.websocket end, get = function() return Fluxus.websocket.connect end, name = "Fluxus" },
+        { check = function() return getgenv and getgenv().WebSocket end, get = function() return getgenv().WebSocket.connect end, name = "Environment" },
+        { check = function() return websocket and websocket.connect end, get = function() return websocket.connect end, name = "Generic" }
+    }
+    
+    for _, impl in ipairs(implementations) do
+        local ok, hasIt = pcall(impl.check)
+        if ok and hasIt then
+            local ok2, ws = pcall(impl.get)
+            if ok2 and ws then
+                return ws, impl.name
+            end
+        end
+    end
+    
+    return nil, nil
 end
 
--- Get executor name
 local function getExecutor()
-  if identifyexecutor then
-    local name, version = identifyexecutor()
-    return version and (name .. " " .. version) or name
-  end
-  return "Unknown"
+    local ok, name, version = pcall(function()
+        if identifyexecutor then
+            return identifyexecutor()
+        end
+        return "Unknown", nil
+    end)
+    
+    if ok and name then
+        return version and (name .. " " .. version) or name
+    end
+    return "Unknown"
 end
 
--- Get game info
 local function getGameInfo()
-  local success, productInfo = pcall(function()
-    return MarketplaceService:GetProductInfo(game.PlaceId)
-  end)
-  
-  return {
-    name = success and productInfo.Name or "Unknown",
-    placeId = game.PlaceId,
-    jobId = game.JobId,
-    executor = getExecutor()
-  }
+    local gameName = "Unknown"
+    
+    pcall(function()
+        local info = MarketplaceService:GetProductInfo(game.PlaceId)
+        gameName = info.Name
+    end)
+    
+    return {
+        name = gameName,
+        placeId = game.PlaceId,
+        jobId = game.JobId or "",
+        executor = getExecutor(),
+        timestamp = os.time()
+    }
 end
 
--- JSON encode with error handling
 local function encode(data)
-  local success, result = pcall(function()
-    return HttpService:JSONEncode(data)
-  end)
-  return success and result or nil
+    local ok, result = pcall(HttpService.JSONEncode, HttpService, data)
+    return ok and result or nil
 end
 
--- JSON decode with error handling
 local function decode(str)
-  local success, result = pcall(function()
-    return HttpService:JSONDecode(str)
-  end)
-  return success and result or nil
+    local ok, result = pcall(HttpService.JSONDecode, HttpService, str)
+    return ok and result or nil
 end
+
+--------------------------------------------------------------------------------
+-- Core Networking
+--------------------------------------------------------------------------------
+
+local function send(data)
+    if not _state.ws then
+        if _config.queueOfflineMessages and data.type ~= "heartbeat" then
+            table.insert(_state.messageQueue, data)
+            if #_state.messageQueue > 50 then
+                table.remove(_state.messageQueue, 1)
+            end
+        end
+        return false
+    end
+    
+    local encoded = encode(data)
+    if not encoded then
+        log("error", "Failed to encode message")
+        return false
+    end
+    
+    local ok = pcall(function()
+        _state.ws:Send(encoded)
+    end)
+    
+    return ok
+end
+
+local function flushMessageQueue()
+    if #_state.messageQueue == 0 then return end
+    
+    log("debug", "Flushing " .. #_state.messageQueue .. " queued messages")
+    
+    for _, msg in ipairs(_state.messageQueue) do
+        send(msg)
+        task.wait(0.1) -- Prevent flooding
+    end
+    
+    _state.messageQueue = {}
+end
+
+local function flushLogBatch()
+    if #_logBatch.messages == 0 then return end
+    
+    for _, logMsg in ipairs(_logBatch.messages) do
+        send({
+            type = "log",
+            message = logMsg.message,
+            level = logMsg.level
+        })
+    end
+    
+    _logBatch.messages = {}
+    _logBatch.timer = nil
+end
+
+local function handleMessage(raw)
+    local data = decode(raw)
+    if not data then
+        log("warn", "Received invalid JSON")
+        return
+    end
+    
+    local msgType = data.type
+    
+    if msgType == "connected" then
+        _state.connected = true
+        log("info", "Connected to server")
+        
+    elseif msgType == "authenticated" then
+        _state.authenticated = true
+        _state.sessionId = data.sessionId
+        _state.reconnectAttempts = 0
+        log("info", "Authenticated - Session: " .. tostring(data.sessionId))
+        
+        -- Start heartbeat
+        if _state.heartbeatThread then
+            task.cancel(_state.heartbeatThread)
+        end
+        _state.heartbeatThread = task.spawn(function()
+            while _state.authenticated do
+                task.wait(_config.heartbeatInterval)
+                if _state.authenticated then
+                    send({ type = "heartbeat" })
+                end
+            end
+        end)
+        
+        -- Flush queued messages
+        flushMessageQueue()
+        
+        Afkty.Events.Connected:Fire({
+            sessionId = data.sessionId,
+            message = data.message
+        })
+        
+    elseif msgType == "pong" then
+        -- Heartbeat acknowledged
+        
+    elseif msgType == "command" then
+        log("info", "Command received: " .. tostring(data.command))
+        Afkty.Events.Command:Fire({
+            command = data.command,
+            data = data.data
+        })
+        
+    elseif msgType == "error" then
+        local code = data.code or "SERVER_ERROR"
+        local message = data.message or "Unknown error"
+        
+        if code == "RATE_LIMITED" then
+            log("warn", "Rate limited: " .. message)
+            Afkty.Events.RateLimited:Fire({ message = message })
+        else
+            log("error", message)
+            Afkty.Events.Error:Fire({ code = code, message = message })
+        end
+    end
+end
+
+local function scheduleReconnect()
+    if not _config.autoReconnect then return end
+    
+    if _state.reconnectAttempts >= _config.maxReconnectAttempts then
+        log("error", "Max reconnection attempts reached")
+        Afkty.Events.Error:Fire({
+            code = "MAX_RECONNECT_ATTEMPTS",
+            message = "Connection failed after " .. _config.maxReconnectAttempts .. " attempts"
+        })
+        return
+    end
+    
+    _state.reconnectAttempts = _state.reconnectAttempts + 1
+    local delay = math.min(_config.reconnectDelay * _state.reconnectAttempts, 30)
+    
+    log("info", string.format("Reconnecting in %ds (attempt %d/%d)", 
+        delay, _state.reconnectAttempts, _config.maxReconnectAttempts))
+    
+    Afkty.Events.Reconnecting:Fire({
+        attempt = _state.reconnectAttempts,
+        maxAttempts = _config.maxReconnectAttempts,
+        delay = delay
+    })
+    
+    task.delay(delay, function()
+        if not _state.connected then
+            Afkty:Connect()
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- Public API
+--------------------------------------------------------------------------------
 
 --[[
-  Initialize the SDK
-  
-  @param options table
-    - serverUrl: string (required) - WebSocket server URL
-    - connectionKey: string (required) - Authentication key from API
-    - autoReconnect: boolean (default: true) - Auto reconnect on disconnect
-    - heartbeatInterval: number (default: 10) - Seconds between heartbeats
-    - debug: boolean (default: false) - Enable debug logging
-  
-  @return Afkty instance
+    Initialize the Afkty SDK
+    
+    @param options (table)
+        serverUrl (string, required) - Backend WebSocket URL
+        connectionKey (string, required) - Single-use auth key from API
+        autoReconnect (boolean, default: true) - Auto reconnect on disconnect
+        heartbeatInterval (number, default: 10) - Seconds between heartbeats
+        maxReconnectAttempts (number, default: 10) - Max retry attempts
+        debug (boolean, default: false) - Enable debug logging
+    
+    @return Afkty instance
 ]]
 function Afkty:Init(options)
-  assert(type(options) == "table", "Options table required")
-  assert(options.serverUrl, "serverUrl is required")
-  assert(options.connectionKey, "connectionKey is required")
-  
-  _config.serverUrl = options.serverUrl
-  _config.connectionKey = options.connectionKey
-  _config.autoReconnect = options.autoReconnect ~= false
-  _config.heartbeatInterval = options.heartbeatInterval or 10
-  _config.maxReconnectAttempts = options.maxReconnectAttempts or 10
-  _config.debug = options.debug or false
-  
-  self:Connect()
-  return self
+    assert(type(options) == "table", "Options must be a table")
+    assert(type(options.serverUrl) == "string", "serverUrl is required")
+    assert(type(options.connectionKey) == "string", "connectionKey is required")
+    
+    _config.serverUrl = options.serverUrl
+    _config.connectionKey = options.connectionKey
+    _config.autoReconnect = options.autoReconnect ~= false
+    _config.heartbeatInterval = options.heartbeatInterval or 10
+    _config.maxReconnectAttempts = options.maxReconnectAttempts or 10
+    _config.debug = options.debug == true
+    _config.queueOfflineMessages = options.queueOfflineMessages ~= false
+    
+    if options.statusCooldown then
+        _config.statusCooldown = math.max(1, options.statusCooldown)
+    end
+    
+    self:Connect()
+    return self
 end
 
 --[[
-  Connect to the server
-  Called automatically by Init()
+    Connect to the Afkty server
+    Called automatically by Init()
 ]]
 function Afkty:Connect()
-  if _connected then
-    log("warn", "Already connected")
-    return
-  end
-  
-  local wsConnect, wsType = getWebSocketImpl()
-  if not wsConnect then
-    log("error", "WebSocket not supported by this executor")
-    self.Events.Error:Fire({ 
-      code = "WEBSOCKET_NOT_SUPPORTED",
-      message = "Executor does not support WebSocket connections"
-    })
-    return
-  end
-  
-  log("info", "Connecting via " .. wsType)
-  
-  local success, connection = pcall(wsConnect, _config.serverUrl)
-  if not success then
-    log("error", "Connection failed: " .. tostring(connection))
-    self.Events.Error:Fire({ 
-      code = "CONNECTION_FAILED",
-      message = tostring(connection)
-    })
-    self:_scheduleReconnect()
-    return
-  end
-  
-  _ws = connection
-  
-  _ws.OnMessage:Connect(function(message)
-    self:_handleMessage(message)
-  end)
-  
-  _ws.OnClose:Connect(function()
-    log("info", "Connection closed")
-    local wasAuthenticated = _authenticated
-    _connected = false
-    _authenticated = false
-    
-    if _heartbeatThread then
-      task.cancel(_heartbeatThread)
-      _heartbeatThread = nil
+    if _state.connected then
+        log("warn", "Already connected")
+        return false
     end
     
-    self.Events.Disconnected:Fire({ wasAuthenticated = wasAuthenticated })
-    self:_scheduleReconnect()
-  end)
-  
-  -- Authenticate
-  self:_send({
-    type = "connect",
-    connectionKey = _config.connectionKey,
-    gameInfo = getGameInfo()
-  })
-end
-
--- Internal message handler
-function Afkty:_handleMessage(raw)
-  local data = decode(raw)
-  if not data then
-    log("warn", "Invalid message received")
-    return
-  end
-  
-  local msgType = data.type
-  
-  if msgType == "connected" then
-    _connected = true
-    log("info", "Connected to server")
-    
-  elseif msgType == "authenticated" then
-    _authenticated = true
-    _reconnectAttempts = 0
-    log("info", "Authenticated - Session: " .. (data.sessionId or "unknown"))
-    self:_startHeartbeat()
-    self.Events.Connected:Fire({
-      sessionId = data.sessionId,
-      message = data.message
-    })
-    
-  elseif msgType == "pong" then
-    -- Heartbeat acknowledged
-    
-  elseif msgType == "command" then
-    log("info", "Command: " .. tostring(data.command))
-    self.Events.Command:Fire({
-      command = data.command,
-      data = data.data
-    })
-    
-  elseif msgType == "error" then
-    log("error", data.message or "Unknown error")
-    self.Events.Error:Fire({
-      code = data.code or "SERVER_ERROR",
-      message = data.message
-    })
-  end
-end
-
--- Internal send function
-function Afkty:_send(data)
-  if not _ws then
-    return false
-  end
-  
-  local encoded = encode(data)
-  if not encoded then
-    log("error", "Failed to encode message")
-    return false
-  end
-  
-  local success = pcall(function()
-    _ws:Send(encoded)
-  end)
-  
-  return success
-end
-
--- Internal heartbeat loop
-function Afkty:_startHeartbeat()
-  if _heartbeatThread then
-    task.cancel(_heartbeatThread)
-  end
-  
-  _heartbeatThread = task.spawn(function()
-    while _authenticated do
-      task.wait(_config.heartbeatInterval)
-      if _authenticated then
-        self:_send({ type = "heartbeat" })
-      end
+    local wsConnect, wsType = getWebSocket()
+    if not wsConnect then
+        local msg = "WebSocket not supported. Supported executors: Synapse, Script-Ware, Fluxus, Wave, Seliware"
+        log("error", msg)
+        Afkty.Events.Error:Fire({
+            code = "WEBSOCKET_NOT_SUPPORTED",
+            message = msg
+        })
+        return false
     end
-  end)
-end
-
--- Internal reconnection handler
-function Afkty:_scheduleReconnect()
-  if not _config.autoReconnect then
-    return
-  end
-  
-  if _reconnectAttempts >= _config.maxReconnectAttempts then
-    log("error", "Max reconnection attempts reached")
-    self.Events.Error:Fire({
-      code = "MAX_RECONNECT_ATTEMPTS",
-      message = "Failed to reconnect after " .. _config.maxReconnectAttempts .. " attempts"
-    })
-    return
-  end
-  
-  _reconnectAttempts = _reconnectAttempts + 1
-  local delay = math.min(_config.reconnectDelay * _reconnectAttempts, 30)
-  
-  log("info", string.format("Reconnecting in %ds (attempt %d/%d)", 
-    delay, _reconnectAttempts, _config.maxReconnectAttempts))
-  
-  task.delay(delay, function()
-    if not _connected then
-      self:Connect()
+    
+    log("info", "Connecting via " .. wsType .. "...")
+    
+    local ok, ws = pcall(wsConnect, _config.serverUrl)
+    if not ok then
+        log("error", "Connection failed: " .. tostring(ws))
+        Afkty.Events.Error:Fire({
+            code = "CONNECTION_FAILED",
+            message = tostring(ws)
+        })
+        scheduleReconnect()
+        return false
     end
-  end)
+    
+    _state.ws = ws
+    
+    ws.OnMessage:Connect(handleMessage)
+    
+    ws.OnClose:Connect(function()
+        log("info", "Connection closed")
+        local wasAuthenticated = _state.authenticated
+        
+        _state.ws = nil
+        _state.connected = false
+        _state.authenticated = false
+        _state.sessionId = nil
+        
+        if _state.heartbeatThread then
+            pcall(task.cancel, _state.heartbeatThread)
+            _state.heartbeatThread = nil
+        end
+        
+        Afkty.Events.Disconnected:Fire({
+            wasAuthenticated = wasAuthenticated,
+            willReconnect = _config.autoReconnect
+        })
+        
+        scheduleReconnect()
+    end)
+    
+    -- Authenticate with server
+    send({
+        type = "connect",
+        connectionKey = _config.connectionKey,
+        gameInfo = getGameInfo()
+    })
+    
+    return true
 end
 
 --[[
-  Send a log message to the mobile app
-  
-  @param message string - Log message
-  @param level string (optional) - Log level: "info", "warn", "error", "debug"
-  
-  @return boolean - Success
+    Send a log message to the mobile app
+    Logs are batched to reduce network traffic
+    
+    @param message (string) - Log message
+    @param level (string, optional) - "info", "warn", "error", "debug"
+    @return boolean - Success
 ]]
 function Afkty:Log(message, level)
-  assert(type(message) == "string", "Message must be a string")
-  
-  return self:_send({
-    type = "log",
-    message = message,
+    if type(message) ~= "string" then
+        message = tostring(message)
+    end
+    
     level = level or "info"
-  })
-end
-
---[[
-  Update status displayed on mobile app
-  
-  @param status string - Status text
-  @param data table (optional) - Additional data
-  
-  @return boolean - Success
-]]
-function Afkty:SetStatus(status, data)
-  assert(type(status) == "string", "Status must be a string")
-  
-  return self:_send({
-    type = "status",
-    status = status,
-    data = data or {}
-  })
-end
-
---[[
-  Send a notification to the mobile app
-  Triggers a push notification if FCM is configured
-  
-  @param title string - Notification title
-  @param message string - Notification body
-  
-  @return boolean - Success
-]]
-function Afkty:Notify(title, message)
-  assert(type(title) == "string", "Title must be a string")
-  assert(type(message) == "string", "Message must be a string")
-  
-  return self:_send({
-    type = "notify",
-    title = title,
-    message = message
-  })
-end
-
---[[
-  Disconnect from the server
-  
-  @param reason string (optional) - Disconnect reason
-]]
-function Afkty:Disconnect(reason)
-  _config.autoReconnect = false
-  
-  if _heartbeatThread then
-    task.cancel(_heartbeatThread)
-    _heartbeatThread = nil
-  end
-  
-  if _ws then
-    self:_send({
-      type = "disconnect",
-      reason = reason or "Manual disconnect"
+    
+    -- Add to batch
+    table.insert(_logBatch.messages, {
+        message = message,
+        level = level
     })
     
-    task.wait(0.3)
-    pcall(function() _ws:Close() end)
-    _ws = nil
-  end
-  
-  _connected = false
-  _authenticated = false
-  log("info", "Disconnected: " .. (reason or "Manual disconnect"))
+    -- Start batch timer if not running
+    if not _logBatch.timer then
+        _logBatch.timer = task.delay(_config.logBatchDelay, flushLogBatch)
+    end
+    
+    -- Flush immediately if batch is full
+    if #_logBatch.messages >= _config.logBatchSize then
+        if _logBatch.timer then
+            pcall(task.cancel, _logBatch.timer)
+        end
+        flushLogBatch()
+    end
+    
+    return true
 end
 
 --[[
-  Check if connected and authenticated
-  
-  @return boolean
+    Send log immediately without batching
+    Use for important messages that need instant delivery
+    
+    @param message (string) - Log message
+    @param level (string, optional) - "info", "warn", "error", "debug"
+    @return boolean - Success
+]]
+function Afkty:LogNow(message, level)
+    if type(message) ~= "string" then
+        message = tostring(message)
+    end
+    
+    return send({
+        type = "log",
+        message = message,
+        level = level or "info"
+    })
+end
+
+--[[
+    Update status displayed on mobile app
+    Includes built-in cooldown to prevent rate limiting
+    
+    @param status (string) - Status text
+    @param data (table, optional) - Additional data
+    @param force (boolean, optional) - Bypass cooldown
+    @return boolean - Success
+]]
+function Afkty:SetStatus(status, data, force)
+    if type(status) ~= "string" then
+        status = tostring(status)
+    end
+    
+    local now = os.clock()
+    
+    -- Check cooldown unless forced
+    if not force and _state.lastStatus == status then
+        return false -- Same status, skip
+    end
+    
+    if not force and (now - _state.lastStatusTime) < _config.statusCooldown then
+        log("debug", "Status update skipped (cooldown)")
+        return false
+    end
+    
+    _state.lastStatus = status
+    _state.lastStatusTime = now
+    
+    return send({
+        type = "status",
+        status = status,
+        data = data or {}
+    })
+end
+
+--[[
+    Send a push notification to mobile app
+    Rate limited: 5 per minute
+    
+    @param title (string) - Notification title
+    @param message (string) - Notification body
+    @return boolean - Success
+]]
+function Afkty:Notify(title, message)
+    assert(type(title) == "string", "title must be a string")
+    assert(type(message) == "string", "message must be a string")
+    
+    return send({
+        type = "notify",
+        title = title,
+        message = message
+    })
+end
+
+--[[
+    Disconnect from the server
+    
+    @param reason (string, optional) - Disconnect reason
+]]
+function Afkty:Disconnect(reason)
+    _config.autoReconnect = false
+    reason = reason or "Manual disconnect"
+    
+    -- Flush pending logs
+    flushLogBatch()
+    
+    if _state.heartbeatThread then
+        pcall(task.cancel, _state.heartbeatThread)
+        _state.heartbeatThread = nil
+    end
+    
+    if _state.ws then
+        send({
+            type = "disconnect",
+            reason = reason
+        })
+        
+        task.wait(0.2)
+        pcall(function() _state.ws:Close() end)
+        _state.ws = nil
+    end
+    
+    _state.connected = false
+    _state.authenticated = false
+    _state.sessionId = nil
+    
+    log("info", "Disconnected: " .. reason)
+end
+
+--[[
+    Check connection status
+    @return boolean - True if connected and authenticated
 ]]
 function Afkty:IsConnected()
-  return _authenticated
+    return _state.authenticated == true
 end
 
 --[[
-  Get current configuration
-  
-  @return table
+    Get current session ID
+    @return string|nil - Session ID or nil if not connected
 ]]
-function Afkty:GetConfig()
-  return {
-    serverUrl = _config.serverUrl,
-    autoReconnect = _config.autoReconnect,
-    heartbeatInterval = _config.heartbeatInterval,
-    debug = _config.debug
-  }
+function Afkty:GetSessionId()
+    return _state.sessionId
 end
 
--- Cleanup on player leaving
-Players.LocalPlayer.AncestryChanged:Connect(function(_, parent)
-  if not parent then
-    Afkty:Disconnect("Player left game")
-  end
+--[[
+    Get SDK version
+    @return string - Version string
+]]
+function Afkty:GetVersion()
+    return Afkty.Version
+end
+
+--[[
+    Get connection info
+    @return table - Connection details
+]]
+function Afkty:GetInfo()
+    return {
+        version = Afkty.Version,
+        connected = _state.connected,
+        authenticated = _state.authenticated,
+        sessionId = _state.sessionId,
+        serverUrl = _config.serverUrl,
+        reconnectAttempts = _state.reconnectAttempts,
+        queuedMessages = #_state.messageQueue
+    }
+end
+
+--------------------------------------------------------------------------------
+-- Auto-cleanup
+--------------------------------------------------------------------------------
+
+-- Disconnect when player leaves
+local player = Players.LocalPlayer
+if player then
+    player.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            Afkty:Disconnect("Player left game")
+        end
+    end)
+end
+
+-- Handle game closing
+game:BindToClose(function()
+    Afkty:Disconnect("Game closing")
+    task.wait(0.5)
 end)
 
 return Afkty
