@@ -599,10 +599,4 @@ if player then
     end)
 end
 
--- Handle game closing
-game:BindToClose(function()
-    Afkty:Disconnect("Game closing")
-    task.wait(0.5)
-end)
-
 return Afkty
