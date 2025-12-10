@@ -511,6 +511,25 @@ function Afkty:Notify(title, message)
 end
 
 --[[
+    Send a CRITICAL ALERT to mobile app with alarm sound
+    Use for important events like kicks, bans, crashes
+    Rate limited: 5 per minute (shared with Notify)
+    
+    @param reason (string) - Alert reason/message
+    @param title (string, optional) - Custom alert title
+    @return boolean - Success
+]]
+function Afkty:Alert(reason, title)
+    assert(type(reason) == "string", "reason must be a string")
+    
+    return send({
+        type = "alert",
+        reason = reason,
+        title = title or "🚨 CRITICAL ALERT"
+    })
+end
+
+--[[
     Disconnect from the server
     
     @param reason (string, optional) - Disconnect reason
