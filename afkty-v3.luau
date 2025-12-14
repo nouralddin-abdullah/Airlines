@@ -804,23 +804,23 @@ function Afkty:SafeCall(fn, alertTitle)
 end
 
 --[[
-    Simple setup - just provide your 6-character key from the app!
-    This is the easiest way to get started for personal use.
+    Simple setup for hub users - provide your key and the hub's key
     
     @param userKey (string) - Your 6-character connection key from the AFKTY app
-    @param hubKey (string, optional) - Hub key if using through a script hub
+    @param hubKey (string) - Hub API key (REQUIRED - provided by the script developer)
     
     @example
         local AFKTY = loadstring(game:HttpGet("..."))()
-        AFKTY.SetUserKey("ABC123")
+        AFKTY.SetUserKey("ABC123", "hub_live_xxx")
 ]]
 function Afkty.SetUserKey(userKey, hubKey)
     assert(type(userKey) == "string" and #userKey > 0, "User key is required")
+    assert(type(hubKey) == "string" and hubKey:match("^hub_live_"), "Hub key is required (get from script developer)")
     
     log("info", "Starting with key: " .. userKey:sub(1, 2) .. "****")
     
     return Afkty:Init({
-        hubKey = hubKey or "hub_public",  -- Use public hub if no hub key
+        hubKey = hubKey,
         userToken = userKey,
         autoReconnect = true,
         debug = false
