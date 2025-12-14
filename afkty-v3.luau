@@ -158,22 +158,33 @@ local function log(level, msg)
 end
 
 local function getWebSocket()
-    local implementations = {
-        { check = function() return syn and syn.websocket end, get = function() return syn.websocket.connect end, name = "Synapse" },
-        { check = function() return WebSocket end, get = function() return WebSocket.connect end, name = "WebSocket" },
-        { check = function() return Fluxus and Fluxus.websocket end, get = function() return Fluxus.websocket.connect end, name = "Fluxus" },
-        { check = function() return wave and wave.websocket end, get = function() return wave.websocket.connect end, name = "Wave" },
-        { check = function() return getgenv and getgenv().WebSocket end, get = function() return getgenv().WebSocket.connect end, name = "Environment" },
-        { check = function() return websocket and websocket.connect end, get = function() return websocket.connect end, name = "Generic" }
-    }
+    -- Standard UNC (Unified Naming Convention) - most executors use this
+    if websocket and websocket.connect then
+        return websocket.connect, "UNC"
+    end
     
-    for _, impl in ipairs(implementations) do
-        local ok, hasIt = pcall(impl.check)
-        if ok and hasIt then
-            local ok2, ws = pcall(impl.get)
-            if ok2 and ws then
-                return ws, impl.name
-            end
+    -- Fallback implementations for specific executors
+    if syn and syn.websocket and syn.websocket.connect then
+        return syn.websocket.connect, "Synapse"
+    end
+    
+    if WebSocket and WebSocket.connect then
+        return WebSocket.connect, "WebSocket"
+    end
+    
+    if Fluxus and Fluxus.websocket and Fluxus.websocket.connect then
+        return Fluxus.websocket.connect, "Fluxus"
+    end
+    
+    if wave and wave.websocket and wave.websocket.connect then
+        return wave.websocket.connect, "Wave"
+    end
+    
+    -- Check global environment
+    if getgenv then
+        local env = getgenv()
+        if env and env.WebSocket and env.WebSocket.connect then
+            return env.WebSocket.connect, "Environment"
         end
     end
     
