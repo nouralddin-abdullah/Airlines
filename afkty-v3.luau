@@ -78,7 +78,7 @@ local _state = {
 -- ============================================================================
 
 -- DEVELOPMENT: Change to production URL before release
-local SERVER_URL = "ws://192.168.1.9:3000"
+local SERVER_URL = "ws://192.168.1.9:3000/ws"
 -- PRODUCTION: local SERVER_URL = "wss://api.afkty.com/ws"
 
 local STATUS_COOLDOWN = 5  -- Minimum seconds between status updates (enforced)
