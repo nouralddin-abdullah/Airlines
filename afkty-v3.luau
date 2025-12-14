@@ -828,15 +828,18 @@ function Afkty.SetUserKey(userKey, hubKey)
 end
 
 -- ============================================================================
--- AUTO-DISCONNECT ON GAME LEAVING
+-- AUTO-DISCONNECT ON PLAYER LEAVING (Client-compatible)
 -- ============================================================================
 
-game:BindToClose(function()
-    if _state.connected then
-        Afkty:Disconnect("Game closing")
-        task.wait(0.5)
-    end
-end)
+local player = Players.LocalPlayer
+if player then
+    -- Detect when player is removed from game
+    player.AncestryChanged:Connect(function(_, parent)
+        if not parent and _state.connected then
+            Afkty:Disconnect("Player left game")
+        end
+    end)
+end
 
 -- ============================================================================
 -- RETURN SDK
