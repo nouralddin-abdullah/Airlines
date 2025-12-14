@@ -450,7 +450,7 @@ end
     @example
         Afkty:Init({
             hubKey = "hub_live_xxx",        -- From script developer
-            userToken = "usr_tk_xxx",       -- Your personal token
+            userToken = "ABC123",           -- Your 6-character key
             debug = true
         })
 ]]
@@ -459,13 +459,9 @@ function Afkty:Init(options)
     assert(type(options.hubKey) == "string", "hubKey is required (get from script developer)")
     assert(type(options.userToken) == "string", "userToken is required (get from AFKTY app)")
     
-    -- Validate format
+    -- Validate hub key format
     if not options.hubKey:match("^hub_live_") then
         log("warn", "hubKey should start with 'hub_live_' - check if correct")
-    end
-    
-    if not options.userToken:match("^usr_tk_") then
-        log("warn", "userToken should start with 'usr_tk_' - check if correct")
     end
     
     -- Apply config
