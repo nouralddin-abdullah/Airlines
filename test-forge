@@ -4282,7 +4282,16 @@ local HammerMinigame = ForgeGui:WaitForChild("HammerMinigame", 10)
 -- ==================== SKIP TO HAMMER (FastForge) ====================
 -- Hook ForgeController.ChangeSequence to skip Melt & Pour
 -- We still call the server for each phase with PERFECT completion values
+-- Using getgenv() for Delta executor compatibility
+getgenv().SkipToHammerHooked = getgenv().SkipToHammerHooked or false
+getgenv().OriginalChangeSequence = getgenv().OriginalChangeSequence or nil
+
 task.spawn(function()
+    -- Guard against double-hooking on Delta executor
+    if getgenv().SkipToHammerHooked then
+        return
+    end
+    
     local Shared = ReplicatedStorage:WaitForChild("Shared")
     local Packages = Shared:WaitForChild("Packages")
     local Knit = require(Packages:WaitForChild("Knit"))
@@ -4299,7 +4308,14 @@ task.spawn(function()
         return
     end
     
-    local originalChangeSequence = ForgeController.ChangeSequence
+    -- Store original in getgenv() for Delta executor persistence
+    if not getgenv().OriginalChangeSequence then
+        getgenv().OriginalChangeSequence = ForgeController.ChangeSequence
+    end
+    local originalChangeSequence = getgenv().OriginalChangeSequence
+    
+    -- Mark as hooked to prevent double-hooking
+    getgenv().SkipToHammerHooked = true
     
     ForgeController.ChangeSequence = function(self, sequenceName, data, ...)
         -- Only intercept if SkipToHammer is enabled and sequence is Melt
@@ -4444,6 +4460,9 @@ task.spawn(function()
 
     -- ==================== AUTO COMPLETE HAMMER ====================
     -- Watches for mold destruction, then immediately skips to Water sequence
+    -- Using getgenv() for Delta executor compatibility
+    getgenv().OriginalHammerStart = getgenv().OriginalHammerStart or nil
+    
     task.spawn(function()
         local hammerModule
         for _ = 1, 120 do
@@ -4458,8 +4477,14 @@ task.spawn(function()
         end
         hammerModule.__AutoCompleteHammerInstalled = true
 
-        local originalStart = hammerModule.Start
+        -- Store original in getgenv() for Delta executor persistence
+        if not getgenv().OriginalHammerStart then
+            getgenv().OriginalHammerStart = hammerModule.Start
+        end
+        local originalStart = getgenv().OriginalHammerStart
+        
         hammerModule.Start = function(self2, startData, ...)
+            local results = {originalStart(self2, startData, ...)}
             local results = {originalStart(self2, startData, ...)}
             
             if getgenv().AutoCompleteHammer then
@@ -4495,18 +4520,19 @@ task.spawn(function()
 end)
 
 -- ==================== MELT MINIGAME AUTOMATION ====================
-local meltConnection = nil
-local meltActive = false
+-- Using getgenv() for Delta executor compatibility
+getgenv().meltConnection = getgenv().meltConnection or nil
+getgenv().meltActive = getgenv().meltActive or false
 
 local function AutomateMelt()
-    if meltConnection then meltConnection:Disconnect() end
-    if meltActive then return end
-    meltActive = true
+    if getgenv().meltConnection then getgenv().meltConnection:Disconnect() end
+    if getgenv().meltActive then return end
+    getgenv().meltActive = true
     
     local Heater = MeltMinigame:FindFirstChild("Heater")
-    if not Heater then meltActive = false return end
+    if not Heater then getgenv().meltActive = false return end
     local TopButton = Heater:FindFirstChild("Top")
-    if not TopButton then meltActive = false return end
+    if not TopButton then getgenv().meltActive = false return end
     
     local function fireMouseDown()
         pcall(function()
@@ -4518,10 +4544,10 @@ local function AutomateMelt()
     
     local pumpPhase = 0
     
-    meltConnection = RunService.Heartbeat:Connect(function(dt)
+    getgenv().meltConnection = RunService.Heartbeat:Connect(function(dt)
         if not MeltMinigame.Visible then
-            if meltConnection then meltConnection:Disconnect() meltConnection = nil end
-            meltActive = false
+            if getgenv().meltConnection then getgenv().meltConnection:Disconnect() getgenv().meltConnection = nil end
+            getgenv().meltActive = false
             return
         end
         
@@ -4539,21 +4565,22 @@ local function AutomateMelt()
 end
 
 -- ==================== POUR MINIGAME AUTOMATION ====================
-local pourConnection = nil
-local pourActive = false
-local originalAreaSize = nil
+-- Using getgenv() for Delta executor compatibility
+getgenv().pourConnection = getgenv().pourConnection or nil
+getgenv().pourActive = getgenv().pourActive or false
+getgenv().originalAreaSize = getgenv().originalAreaSize or nil
 
 local function AutomatePour()
-    if pourActive then return end
-    pourActive = true
+    if getgenv().pourActive then return end
+    getgenv().pourActive = true
     
     local Frame = PourMinigame:FindFirstChild("Frame")
-    if not Frame then pourActive = false return end
+    if not Frame then getgenv().pourActive = false return end
     local Area = Frame:FindFirstChild("Area")
     
-    if not Area then pourActive = false return end
+    if not Area then getgenv().pourActive = false return end
     
-    originalAreaSize = Area.Size
+    getgenv().originalAreaSize = Area.Size
     Area.Size = UDim2.new(1, 0, 1.12, 0)
 end
 
@@ -4561,17 +4588,17 @@ PourMinigame:GetPropertyChangedSignal("Visible"):Connect(function()
     if PourMinigame.Visible and getgenv().AutoPour then
         task.delay(0.1, AutomatePour)
     elseif not PourMinigame.Visible then
-        if originalAreaSize then
+        if getgenv().originalAreaSize then
             local Frame = PourMinigame:FindFirstChild("Frame")
             if Frame then
                 local Area = Frame:FindFirstChild("Area")
                 if Area then
-                    Area.Size = originalAreaSize
+                    Area.Size = getgenv().originalAreaSize
                 end
             end
-            originalAreaSize = nil
+            getgenv().originalAreaSize = nil
         end
-        pourActive = false
+        getgenv().pourActive = false
     end
 end)
 
@@ -4712,8 +4739,8 @@ MeltMinigame:GetPropertyChangedSignal("Visible"):Connect(function()
     if MeltMinigame.Visible and getgenv().AutoMelt then
         task.delay(0.3, AutomateMelt)
     elseif not MeltMinigame.Visible then
-        if meltConnection then meltConnection:Disconnect() meltConnection = nil end
-        meltActive = false
+        if getgenv().meltConnection then getgenv().meltConnection:Disconnect() getgenv().meltConnection = nil end
+        getgenv().meltActive = false
     end
 end)
 
