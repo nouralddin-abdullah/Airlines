@@ -13,7 +13,7 @@
     ║  • Log batching for performance                                           ║
     ║  • Rate limit handling                                                    ║
     ║                                                                           ║
-    ║  Docs: https://docs.afkty.com                                             ║
+    ║  Docs: https://afkty-docs.vercel.app                                     ║
     ╚═══════════════════════════════════════════════════════════════════════════╝
 ]]
 
@@ -73,15 +73,10 @@ local _state = {
     isShuttingDown = false
 }
 
--- ============================================================================
--- CONSTANTS (not configurable by hubs - security measure)
--- ============================================================================
 
--- DEVELOPMENT: Change to production URL before release
-local SERVER_URL = "ws://192.168.1.9:3000/ws"
--- PRODUCTION: local SERVER_URL = "wss://api.afkty.com/ws"
+local SERVER_URL = "ws://13.48.135.47:3001/ws"
 
-local STATUS_COOLDOWN = 5  -- Minimum seconds between status updates (enforced)
+local STATUS_COOLDOWN = 5
 
 -- ============================================================================
 -- CONFIGURATION
