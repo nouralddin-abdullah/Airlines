@@ -74,7 +74,7 @@ local _state = {
 }
 
 
-local SERVER_URL = "ws://13.48.135.47:3001/ws"
+local SERVER_URL = "wss://afkty.toastyhub.fun/ws"
 
 local STATUS_COOLDOWN = 5
 
