@@ -74,7 +74,7 @@ local _state = {
 }
 
 
-local SERVER_URL = "ws://13.48.135.47:3001/ws"
+local SERVER_URL = "ws://192.168.1.9:3000/ws"
 
 local STATUS_COOLDOWN = 5
 
